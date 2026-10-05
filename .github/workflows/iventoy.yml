@@ -1,0 +1,146 @@
+name: iVentoy Build
+
+on:
+  schedule:
+    # 每6小时检查一次
+    - cron: '10 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'Dockerfile'
+      - 'start_iventoy.sh'
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Check iVentoy version
+      id: version-check
+      run: |
+        echo "检查 iVentoy 版本..."
+
+        LATEST_VERSION=$(curl -fsSL --retry 3 \
+          -H "Accept: application/vnd.github+json" \
+          -H "User-Agent: GitHub-Action" \
+          https://api.github.com/repos/ventoy/PXE/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+
+        if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" = "null" ]; then
+          echo "❌ 无法获取最新版本"
+          exit 1
+        fi
+
+        echo "🐳 最新版本: $LATEST_VERSION"
+
+        if [ -f "version" ]; then
+          CURRENT_VERSION=$(cat version)
+          echo "📦 当前版本: $CURRENT_VERSION"
+        else
+          CURRENT_VERSION=""
+          echo "📦 当前版本: 未记录"
+        fi
+
+        if [ "$LATEST_VERSION" != "$CURRENT_VERSION" ]; then
+          echo "✅ 发现新版本，需要构建镜像"
+          echo "should-build=true" >> $GITHUB_OUTPUT
+          echo "new-version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          echo "old-version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+        else
+          echo "ℹ️ 版本相同，无需构建"
+          echo "should-build=false" >> $GITHUB_OUTPUT
+          echo "new-version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          echo "old-version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Update version file
+      if: steps.version-check.outputs.should-build == 'true'
+      run: |
+        NEW_VERSION="${{ steps.version-check.outputs.new-version }}"
+        echo "$NEW_VERSION" > version
+        echo "✅ 已更新版本文件: $NEW_VERSION"
+
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add version
+        git commit -m "Update iVentoy version to $NEW_VERSION"
+        git push
+
+    - name: Set up QEMU
+      if: steps.version-check.outputs.should-build == 'true'
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      if: steps.version-check.outputs.should-build == 'true'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      if: steps.version-check.outputs.should-build == 'true'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Build and push Docker image
+      if: steps.version-check.outputs.should-build == 'true'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        build-args: |
+          VERSION=${{ steps.version-check.outputs.new-version }}
+        tags: |
+          xkand/iventoy:${{ steps.version-check.outputs.new-version }}
+          xkand/iventoy:latest
+        labels: |
+          org.opencontainers.image.title=iVentoy
+          org.opencontainers.image.description=iVentoy PXE/HTTPBoot server in Docker
+          org.opencontainers.image.version=${{ steps.version-check.outputs.new-version }}
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Create release notification
+      if: steps.version-check.outputs.should-build == 'true'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const newVersion = '${{ steps.version-check.outputs.new-version }}';
+          const oldVersion = '${{ steps.version-check.outputs.old-version }}';
+
+          const title = `🐳 iVentoy Updated to ${newVersion}`;
+          const body = `
+          ## iVentoy Version Update
+
+          **Old Version:** ${oldVersion || 'Not recorded'}
+          **New Version:** ${newVersion}
+
+          Docker image has been built and pushed to Docker Hub.
+
+          **Image Tags:**
+          - \`xkand/iventoy:${newVersion}\`
+          - \`xkand/iventoy:latest\`
+
+          **Workflow:** [View Build Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ---
+          *This update was triggered automatically by version check.*
+          `;
+
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: title,
+            body: body,
+            labels: ['iventoy', 'version-update', 'automated']
+          });
